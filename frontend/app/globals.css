@@ -1,0 +1,44 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* PrepMate AI — theme tokens. Light is default; [data-theme="dark"] overrides.
+   Pages use bg-[var(--surface)] / text-[var(--text)] etc. so one toggle
+   re-themes the app. Accent (#2563EB) and status colors are identical in
+   both themes; only surfaces and text adapt. */
+:root,
+[data-theme="light"] {
+  --bg: #ffffff;
+  --surface: #ffffff;
+  --surface-2: #f4f5f7;
+  --border: #e6e7ee;
+  --text: #101014;
+  --muted: #55565e;
+  --faint: #6b6b76;
+  --nav-bg: rgba(255, 255, 255, 0.85);
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  --bg: #0a0a18;
+  --surface: rgba(255, 255, 255, 0.04);
+  --surface-2: rgba(255, 255, 255, 0.07);
+  --border: rgba(255, 255, 255, 0.1);
+  --text: #ffffff;
+  --muted: rgba(255, 255, 255, 0.65);
+  --faint: rgba(255, 255, 255, 0.5);
+  --nav-bg: rgba(10, 10, 24, 0.8);
+  color-scheme: dark;
+}
+
+body {
+  color: var(--text);
+  background: var(--bg);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}

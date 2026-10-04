@@ -1,0 +1,28 @@
+# ─── Secrets (backend/.env, frontend/.env.local) ─────────────────────────────
+.env
+.env.*
+!.env.example
+!.env.local.example
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+**/__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# ─── Node / Next.js ──────────────────────────────────────────────────────────
+node_modules/
+.next/
+out/
+build/
+*.tsbuildinfo
+
+# ─── Editors / OS ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
