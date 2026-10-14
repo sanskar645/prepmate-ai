@@ -122,6 +122,20 @@ export default function InterviewRoomPage({
   const tabSwitchesRef = useRef(0);
   const recordingRef = useRef(false);
   const [visionReady, setVisionReady] = useState(false);
+  // Live proctoring warnings (multi-face + tab switch). Toasts only — the
+  // counts still upload as telemetry for the report integrity statement.
+  const [proctorAlerts, setProctorAlerts] = useState<
+    { id: number; kind: "faces" | "tab"; message: string }[]
+  >([]);
+  const alertIdRef = useRef(0);
+  const lastFaceWarnRef = useRef(0);
+  const pushAlert = useCallback((kind: "faces" | "tab", message: string) => {
+    const id = ++alertIdRef.current;
+    setProctorAlerts((prev) => [...prev.slice(-2), { id, kind, message }]);
+    setTimeout(() => {
+      setProctorAlerts((prev) => prev.filter((a) => a.id !== id));
+    }, 6000);
+  }, []);
   // StrictMode double-invokes effects in dev — without this guard the first
   // question is spoken AND transcribed twice (the duplicate AI lines).
   const bootedRef = useRef(false);
@@ -271,12 +285,15 @@ export default function InterviewRoomPage({
     if (el) el.scrollTop = el.scrollHeight;
   }, [state.transcript, lastEval]);
 
-  // ── Presence sampling: one frame per second while recording ───────────────
-  // Counts faces (multi-face = possible second person) but uploads counts
-  // only — frames never leave the browser.
+  // ── Presence + proctor monitoring: face watch runs for the whole
+  // interview (not just while recording); presence samples are collected
+  // only while recording for scoring. Frames never leave the browser.
   useEffect(() => {
-    if (!state.isRecording || !visionReady) return;
-    recordingRef.current = true;
+    recordingRef.current = state.isRecording;
+  }, [state.isRecording]);
+
+  useEffect(() => {
+    if (!visionReady || state.phase === "completed") return;
     const id = setInterval(async () => {
       if (samplingBusyRef.current) return;
       const video = videoRef.current;
@@ -288,8 +305,19 @@ export default function InterviewRoomPage({
           .detectAllFaces(video, new api.TinyFaceDetectorOptions())
           .withFaceExpressions();
         const faces = dets.length;
-        if (faces > 1) multiFaceRef.current += 1;
+        if (faces > 1) {
+          multiFaceRef.current += 1;
+          const nowMs = Date.now();
+          if (nowMs - lastFaceWarnRef.current > 10000) {
+            lastFaceWarnRef.current = nowMs;
+            pushAlert(
+              "faces",
+              "More than one face visible. Only you should be in frame."
+            );
+          }
+        }
         if (faces > maxFacesRef.current) maxFacesRef.current = faces;
+        if (!recordingRef.current) return;
         const first = dets[0];
         const sample: PresenceSample = first
           ? {
@@ -311,21 +339,24 @@ export default function InterviewRoomPage({
     }, 1000);
     return () => {
       clearInterval(id);
-      recordingRef.current = false;
     };
-  }, [state.isRecording, visionReady]);
+  }, [visionReady, state.phase, pushAlert]);
 
-  // ── Tab-switch tracking: leaving the tab mid-recording is an integrity
-  // signal (possible lookup on another tab or device).
+  // ── Tab-switch tracking: leaving the tab mid-interview warns live and
+  // uploads as telemetry (possible lookup on another tab or device).
   useEffect(() => {
     function onVisibility() {
-      if (document.hidden && recordingRef.current) {
+      if (document.hidden) {
         tabSwitchesRef.current += 1;
+        pushAlert(
+          "tab",
+          "You left the interview tab. Stay on this tab for the full session."
+        );
       }
     }
     document.addEventListener("visibilitychange", onVisibility);
     return () => document.removeEventListener("visibilitychange", onVisibility);
-  }, []);
+  }, [pushAlert]);
 
   // ── Answer countdown: ticks while the question is answerable (idle or
   // recording). TTS time doesn't count — the clock starts when you can act.
@@ -618,6 +649,39 @@ export default function InterviewRoomPage({
 
   return (
     <div className="h-[calc(100vh-64px)] flex flex-col bg-[#0A0A18]">
+      {/* Proctored session banner */}
+      <div className="px-4 pt-3 flex items-center gap-2">
+        <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-[#FCA5A5] bg-[#EF4444]/10 border border-[#EF4444]/30 px-2.5 py-1 rounded-lg">
+          <span className="w-1.5 h-1.5 bg-[#EF4444] rounded-full animate-pulse" />
+          Proctored
+        </span>
+        <p className="text-white/40 text-xs">
+          Stay visible, one face in frame, stay on this tab.
+        </p>
+      </div>
+      {/* Proctoring warning toasts */}
+      {proctorAlerts.length > 0 && (
+        <div className="fixed top-16 left-1/2 -translate-x-1/2 z-50 space-y-2 w-[min(28rem,90vw)]">
+          {proctorAlerts.map((a) => (
+            <div
+              key={a.id}
+              className="flex items-start gap-2 bg-[#1A0A0A] border border-[#EF4444]/50 text-sm text-[#FCA5A5] px-4 py-3 rounded-xl shadow-lg"
+            >
+              <AlertIcon size={15} />
+              <span className="flex-1">{a.message}</span>
+              <button
+                onClick={() =>
+                  setProctorAlerts((prev) => prev.filter((x) => x.id !== a.id))
+                }
+                aria-label="Dismiss warning"
+                className="text-white/40 hover:text-white/80"
+              >
+                <XMarkIcon size={13} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       {/* Main area */}
       <div className="flex flex-1 flex-col md:flex-row gap-4 p-4 overflow-hidden">
         {/* Self video */}

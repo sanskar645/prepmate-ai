@@ -75,6 +75,44 @@ export default function InterviewReportPage({
   const [fcError, setFcError] = useState("");
   const [fcIdx, setFcIdx] = useState(0);
   const [fcFlipped, setFcFlipped] = useState(false);
+  // Model answers, fetched on demand per question and cached by answer id.
+  const [modelAnswers, setModelAnswers] = useState<
+    Record<string, { text?: string; loading?: boolean; error?: string }>
+  >({});
+
+  async function loadModelAnswer(
+    answerId: string,
+    questionText: string,
+    interviewType: string,
+    difficulty: string
+  ) {
+    if (modelAnswers[answerId]?.text || modelAnswers[answerId]?.loading) return;
+    setModelAnswers((prev) => ({ ...prev, [answerId]: { loading: true } }));
+    try {
+      const res = await apiFetch<{ model_answer: string }>(
+        "/interview/model-answer",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            question_text: questionText,
+            interview_type: interviewType,
+            difficulty,
+          }),
+        }
+      );
+      setModelAnswers((prev) => ({
+        ...prev,
+        [answerId]: { text: res.model_answer },
+      }));
+    } catch (err: unknown) {
+      setModelAnswers((prev) => ({
+        ...prev,
+        [answerId]: {
+          error: err instanceof Error ? err.message : "Could not load the answer",
+        },
+      }));
+    }
+  }
 
   async function loadFlashcards() {
     setFcLoading(true);
@@ -419,6 +457,39 @@ export default function InterviewReportPage({
                     ))}
                   </ul>
                 </div>
+              </div>
+
+              {/* Model answer (study aid, loaded on demand) */}
+              <div className="mt-3">
+                {modelAnswers[ans.answer_id]?.text ? (
+                  <div className="bg-[#2563EB]/[.06] border border-[#2563EB]/25 rounded-xl p-4">
+                    <p className="text-[#2563EB] text-xs font-semibold uppercase tracking-wider mb-2">
+                      Model answer
+                    </p>
+                    <p className="text-[var(--muted)] text-sm leading-relaxed">
+                      {modelAnswers[ans.answer_id].text}
+                    </p>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() =>
+                      loadModelAnswer(
+                        ans.answer_id,
+                        ans.question_text,
+                        session.interview_type,
+                        session.difficulty
+                      )
+                    }
+                    disabled={modelAnswers[ans.answer_id]?.loading}
+                    className="text-sm font-medium text-[#2563EB] hover:underline disabled:opacity-50"
+                  >
+                    {modelAnswers[ans.answer_id]?.loading
+                      ? "Writing a model answer..."
+                      : modelAnswers[ans.answer_id]?.error
+                        ? "Retry the model answer"
+                        : "Show a model answer for this question"}
+                  </button>
+                )}
               </div>
             </div>
           );

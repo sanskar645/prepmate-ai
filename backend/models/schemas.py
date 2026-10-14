@@ -81,6 +81,12 @@ class EvaluateRequest(BaseModel):
     eval_token: str
 
 
+class ModelAnswerRequest(BaseModel):
+    question_text: str = Field(..., min_length=3, max_length=1000)
+    interview_type: str = Field(default="technical", max_length=30)
+    difficulty: str = Field(default="medium", max_length=20)
+
+
 class PageViewRequest(BaseModel):
     # Page path only (no query strings, no identity) — privacy by design.
     path: str = Field(..., min_length=1, max_length=255)

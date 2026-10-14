@@ -112,11 +112,17 @@ No markdown. No explanations outside JSON."""
 
 # ── STT via Whisper ───────────────────────────────────────────────────────────
 async def _whisper_transcribe(client: AsyncOpenAI, model: str, audio_path: str) -> str:
-    """One Whisper round-trip against an OpenAI-compatible endpoint."""
+    """One Whisper round-trip against an OpenAI-compatible endpoint.
+
+    Language is locked to English: campus interviews are conducted in
+    English, and auto-detect was mis-firing on short answers (e.g. English
+    intros transcribed as Urdu). A forced "en" keeps scoring fair.
+    """
     with open(audio_path, "rb") as f:
         response = await client.audio.transcriptions.create(
             model=model,
             file=f,
+            language="en",
             response_format="text",
         )
     text = response if isinstance(response, str) else getattr(response, "text", None)
@@ -473,3 +479,34 @@ async def generate_flashcards(
         if len(cards) >= count:
             break
     return cards
+
+
+MODEL_ANSWER_PROMPT = """You are PrepMate AI, an experienced campus placement interviewer.
+Write a strong example answer to this interview question so a student can
+study what a good response looks like. The answer should sound like a real
+candidate speaking (first person, 60 to 120 words), specific and structured,
+not a lecture and not bullet points.
+Interview type: {interview_type}
+Difficulty: {difficulty}
+Question: {question}
+Return ONLY the example answer as plain text, no quotes, no intro line."""
+
+
+async def generate_model_answer(
+    question_text: str, interview_type: str = "technical", difficulty: str = "medium"
+) -> str:
+    """One example answer for a report question (single attempt, no retry).
+
+    Non-critical path: any failure returns "" and the route falls back to a
+    static study hint, so this never 500s on model issues.
+    """
+    question = (question_text or "").strip()[:500]
+    if not question:
+        return ""
+    prompt = MODEL_ANSWER_PROMPT.format(
+        interview_type=interview_type or "technical",
+        difficulty=difficulty or "medium",
+        question=question,
+    )
+    text, _ = await _gemini_text(prompt, temperature=0.5)
+    return (text or "").strip()[:1500]

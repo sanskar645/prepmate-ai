@@ -48,6 +48,7 @@ from models.schemas import (
     EndSessionRequest,
     FlashcardsRequest,
     EvaluateRequest,
+    ModelAnswerRequest,
 )
 from services.scoring import (
     calc_composite,
@@ -61,6 +62,7 @@ from services.ai_service import (
     extract_resume_text,
     generate_resume_questions,
     generate_flashcards,
+    generate_model_answer,
 )
 
 router = APIRouter()
@@ -1113,8 +1115,35 @@ def _fallback_flashcards(
     ]
 
 
-# ── Flashcards ──────────────────────────────────────────────────────────────
-@router.post("/flashcards")
+# ── Model answer ────────────────────────────────────────────────────────────
+@router.post("/model-answer")
+async def model_answer(
+    body: ModelAnswerRequest,
+    current_user: dict = Depends(require_student),
+):
+    """One example answer for a report question (study aid, on demand).
+
+    Generated per question so the report stays fast: the frontend fetches
+    only the answers the student expands. LLM failure falls back to a
+    static study hint instead of a 500.
+    """
+    text = await generate_model_answer(
+        body.question_text, body.interview_type, body.difficulty
+    )
+    if not text:
+        text = (
+            "A strong answer names one specific example, explains what you did "
+            "and why, and ends with the result. Re-answer this question aloud "
+            "in 60 to 90 seconds following that shape."
+        )
+    return {
+        "platform": "PrepMate AI",
+        "question_text": body.question_text,
+        "model_answer": text,
+    }
+
+
+# ── Flashcards ──────────────────────────────────────────────────────────────@router.post("/flashcards")
 async def make_flashcards(
     body: FlashcardsRequest,
     current_user: dict = Depends(require_student),
