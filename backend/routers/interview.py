@@ -125,6 +125,14 @@ def _difficulty_sequence(session: dict, answers: list[dict]) -> list[str]:
 # Step 0 is always the self-introduction; resume questions follow it.
 RESUME_SLOTS = (1, 2)
 
+# Full interview contract (Section: full mode): a fixed 30-minute session.
+# The frontend owns the clocks — 40s per HR question, 60s per technical — and
+# auto-ends at 30:00. The backend's job is only to label every question with
+# its kind and to allow enough questions that the bank (not the count) is the
+# limit. When the bank runs dry the session completes early with what it has.
+FULL_TOTAL_QUESTIONS = 25
+FULL_SESSION_SECONDS = 30 * 60
+
 INTRO_PATTERNS = (
     "tell me about yourself",
     "introduce yourself",
@@ -146,7 +154,7 @@ def _pool(db, session: dict, difficulty: str, company_tag: str | None,
     """Active questions of these types/difficulty in a stable, reproducible order."""
     query = (
         db.table("question_bank")
-        .select("question_id,question_text,domain_tag")
+        .select("question_id,question_text,domain_tag,interview_type")
         .eq("difficulty", difficulty)
         .eq("is_active", True)
         .order("question_id")
@@ -193,7 +201,7 @@ def _pick_intro(db) -> dict | None:
     """
     rows = _rows(
         db.table("question_bank")
-        .select("question_id,question_text,domain_tag")
+        .select("question_id,question_text,domain_tag,interview_type")
         .eq("interview_type", "hr")
         .eq("is_active", True)
         .order("question_id")
@@ -220,6 +228,11 @@ def _resume_at(db, session_id: str, step: int) -> dict | None:
     return rows[0] if rows else None
 
 
+def _kind_of_bank_row(row: dict) -> str:
+    """Per-question clock label: technical questions get 60s, everything else 40s."""
+    return "technical" if (row.get("interview_type") or "") == "technical" else "hr"
+
+
 def _resolve_question(
     db,
     session: dict,
@@ -227,28 +240,30 @@ def _resolve_question(
     step: int,
     asked_ids: set[str],
     difficulties: list[str],
-) -> tuple[str | None, str | None, str | None]:
-    """(question_id|None, question_text|None, domain_tag|None) for this step.
+) -> tuple[str | None, str | None, str | None, str]:
+    """(question_id|None, question_text|None, domain_tag|None, kind) for this step.
 
     Single source of truth shared by /start, /answer and /session, so the
     asked, recorded and reported question always match. Resume questions
-    carry no id and no domain.
+    carry no id and no domain. Kind drives the room's per-question clock
+    (full mode: hr → 40s, technical → 60s).
     """
     if step == 0:
         intro = _pick_intro(db)
         if intro:
-            return intro["question_id"], intro["question_text"], intro.get("domain_tag")
+            return intro["question_id"], intro["question_text"], intro.get("domain_tag"), "hr"
         # No HR intro in the bank — fall through to the normal pool.
     elif session.get("resume_text") and step in RESUME_SLOTS:
         resume_row = _resume_at(db, session_id, step)
         if resume_row:
             # Resume questions live outside the bank: no id, no domain.
-            return None, resume_row["question_text"], None
+            # They probe projects and skills, so they get the technical clock.
+            return None, resume_row["question_text"], None, "technical"
         # Generation failed at /start — fall through to the bank.
     picked = _pick_question(db, session, difficulties[step], asked_ids)
     if not picked:
-        return None, None, None
-    return picked["question_id"], picked["question_text"], picked.get("domain_tag")
+        return None, None, None, "hr"
+    return picked["question_id"], picked["question_text"], picked.get("domain_tag"), _kind_of_bank_row(picked)
 
 
 def _average(values: list) -> float:
@@ -322,12 +337,15 @@ async def start_interview(
     user_id = current_user["user_id"]
 
     resume_text = (body.resume_text or "").strip()[:15000]
+    # Full mode is time-boxed (30 min), not count-boxed: the slider values
+    # don't apply, the session carries enough questions for the whole slot.
+    is_full = body.interview_type.value == "full"
     session = {
         "user_id": user_id,
         "interview_type": body.interview_type.value,
         "company_tag": body.company_tag,
         "difficulty": body.difficulty.value,
-        "total_questions": body.total_questions,
+        "total_questions": FULL_TOTAL_QUESTIONS if is_full else body.total_questions,
         "time_per_question": body.time_per_question,
         "resume_text": resume_text or None,
         "status": "in_progress",
@@ -335,7 +353,7 @@ async def start_interview(
 
     # Resolve the first question BEFORE creating the session so we never leave
     # an orphan in_progress session with nothing to ask.
-    first_id, first_text, _ = _resolve_question(
+    first_id, first_text, _, first_kind = _resolve_question(
         db, session, "", 0, set(), [session["difficulty"]]
     )
     if not first_text:
@@ -377,6 +395,7 @@ async def start_interview(
         "platform": "PrepMate AI",
         "first_question": first_id,
         "question_text": first_text,
+        "question_kind": first_kind,
         "difficulty": session["difficulty"],
         "total_questions": session["total_questions"],
         "time_per_question": session["time_per_question"],
@@ -461,7 +480,7 @@ def _resolve_current(db, session: dict, session_id: str):
         )
     difficulties = _difficulty_sequence(session, answers)
     asked_ids = {a["question_id"] for a in answers if a.get("question_id")}
-    current_id, current_text, current_domain = _resolve_question(
+    current_id, current_text, current_domain, current_kind = _resolve_question(
         db, session, session_id, step, asked_ids, difficulties
     )
     if not current_text:
@@ -473,6 +492,7 @@ def _resolve_current(db, session: dict, session_id: str):
         "question_id": current_id,
         "question_text": current_text,
         "domain_tag": current_domain,
+        "kind": current_kind,
     }
 
 
@@ -575,8 +595,9 @@ async def _finish_answer(
     # ── Next question ─────────────────────────────────────────────────────
     next_diff = next_difficulty(composite, difficulties[step])
     next_question = None
+    next_kind = "hr"
     if step + 1 < session["total_questions"]:
-        _, next_question, _ = _resolve_question(
+        _, next_question, _, next_kind = _resolve_question(
             db,
             session,
             session_id,
@@ -602,6 +623,7 @@ async def _finish_answer(
         # stored resume question — so what is spoken, stored and reported
         # always match.
         "next_question": next_question,
+        "next_question_kind": next_kind if next_question else None,
         "difficulty": next_diff,
         "questions_answered": step + 1,
         "total_questions": session["total_questions"],
@@ -927,12 +949,13 @@ async def get_session_state(
     step = len(answers)
 
     current_question: str | None = None
+    current_kind = "hr"
     difficulty = session["difficulty"]
     if session["status"] == "in_progress" and step < session["total_questions"]:
         difficulties = _difficulty_sequence(session, answers)
         difficulty = difficulties[step]
         asked_ids = {a["question_id"] for a in answers if a.get("question_id")}
-        _, current_question, _ = _resolve_question(
+        _, current_question, _, current_kind = _resolve_question(
             db, session, session_id, step, asked_ids, difficulties
         )
 
@@ -942,6 +965,7 @@ async def get_session_state(
         "questions_answered": step,
         "total_questions": session["total_questions"],
         "current_question": current_question,
+        "current_question_kind": current_kind,
         "difficulty": difficulty,
     }
 

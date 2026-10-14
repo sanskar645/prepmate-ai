@@ -46,11 +46,12 @@ class InterviewStartRequest(BaseModel):
     interview_type: InterviewType
     difficulty: Difficulty = Difficulty.medium
     company_tag: Optional[str] = None
-    total_questions: int = Field(default=5, ge=1, le=20)
+    total_questions: int = Field(default=5, ge=1, le=40)
     # Extracted resume/CV text (from POST /interview/parse-resume). Stored on
     # the session; drives resume-based question slots + evaluation context.
     resume_text: Optional[str] = Field(default=None, max_length=20000)
     # Per-question answer time limit in seconds (anti-cheat timer).
+    # Full interviews ignore this: HR questions get 40s, technical 60s.
     time_per_question: int = Field(default=60, ge=15, le=300)
 
 

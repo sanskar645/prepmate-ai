@@ -84,6 +84,8 @@ export interface AnswerEvaluation {
   strengths: string[];
   improvements: string[];
   next_question: string | null;
+  // Per-question clock label for full mode (hr → 40s, technical → 60s).
+  next_question_kind?: string | null;
   // Present on /interview/answer responses; drives the room progress label.
   difficulty?: string;
   questions_answered?: number;

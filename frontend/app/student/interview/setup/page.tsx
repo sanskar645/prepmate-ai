@@ -99,7 +99,14 @@ export default function InterviewSetupPage() {
     setLoading(true);
     setError("");
     try {
-      const res = await apiFetch<{ session_id: string; question_text: string }>(
+      // Full mode is time-boxed (30 min, 40s HR / 60s technical clocks): the
+      // sliders don't apply, the session carries 25 questions for the slot.
+      const isFull = form.interview_type === "full";
+      const res = await apiFetch<{
+        session_id: string;
+        question_text: string;
+        question_kind?: string;
+      }>(
         "/interview/start",
         {
           method: "POST",
@@ -107,6 +114,8 @@ export default function InterviewSetupPage() {
             ...form,
             company_tag: form.company_tag || null,
             resume_text: resume?.text || null,
+            total_questions: isFull ? 25 : form.total_questions,
+            time_per_question: isFull ? 60 : form.time_per_question,
           }),
         }
       );
@@ -116,6 +125,10 @@ export default function InterviewSetupPage() {
         sessionStorage.setItem(
           `prepmate_question_${res.session_id}`,
           res.question_text
+        );
+        sessionStorage.setItem(
+          `prepmate_kind_${res.session_id}`,
+          res.question_kind || "hr"
         );
         sessionStorage.setItem(
           `prepmate_meta_${res.session_id}`,
@@ -265,7 +278,14 @@ export default function InterviewSetupPage() {
             </div>
           </div>
 
-          {/* Number of Questions */}
+          {/* Number of Questions (fixed for full mode: 30-minute session) */}
+          {form.interview_type === "full" ? (
+            <div className="bg-[#2563EB]/[.06] border border-[#2563EB]/25 rounded-xl px-4 py-3 text-sm text-[var(--muted)] leading-relaxed">
+              <span className="font-semibold text-[var(--text)]">30-minute session.</span>{" "}
+              HR questions get 40s each, technical questions 60s each. The
+              session ends automatically at 30:00.
+            </div>
+          ) : (
           <div>
             <label className="block text-sm text-[var(--muted)] mb-1.5">
               Number of Questions:{" "}
@@ -288,9 +308,10 @@ export default function InterviewSetupPage() {
               <span>10</span>
             </div>
           </div>
+          )}
 
-          {/* Answer timer: when it hits zero the current take is submitted,
-              or the question is skipped as a zero when nothing was recorded */}
+          {/* Answer timer (fixed clocks in full mode) */}
+          {form.interview_type === "full" ? null : (
           <div>
             <label className="block text-sm text-[var(--muted)] mb-1.5">
               Seconds per answer:{" "}
@@ -314,6 +335,7 @@ export default function InterviewSetupPage() {
               <span>180s</span>
             </div>
           </div>
+          )}
 
           {/* Resume / CV (optional) */}
           <div>

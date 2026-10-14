@@ -100,8 +100,24 @@ export default function InterviewRoomPage({
   // Answer countdown: seconds left for the current question. Resets on every
   // new question; at zero the take auto-submits (or skips as a zero when
   // nothing was recorded — no time to look answers up).
-  const timeLimit = meta?.time_per_question ?? 60;
+  // Full mode ignores the setup slider: HR questions get 40s, technical 60s.
+  const [qKind, setQKind] = useState<"hr" | "technical">("hr");
+  const qKindRef = useRef<"hr" | "technical">("hr");
+  const metaRef = useRef(meta);
+  metaRef.current = meta;
+  function limitFor(kind: "hr" | "technical"): number {
+    const m = metaRef.current;
+    if (m?.interview_type === "full") return kind === "technical" ? 60 : 40;
+    return m?.time_per_question ?? 60;
+  }
+  const timeLimit = limitFor(qKind);
   const [timeLeft, setTimeLeft] = useState(timeLimit);
+
+  // Full mode is time-boxed: 30:00 from room entry, then auto-end.
+  const FULL_SESSION_SECONDS = 30 * 60;
+  const sessionStartRef = useRef(Date.now());
+  const timeUpRef = useRef(false);
+  const [sessionLeft, setSessionLeft] = useState(FULL_SESSION_SECONDS);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -155,7 +171,6 @@ export default function InterviewRoomPage({
   const [fsBlocked, setFsBlocked] = useState(fsAvailable);
   const [fsExitNotice, setFsExitNotice] = useState(false);
   const hasEnteredFs = useRef(false);
-  const fsOptionalRef = useRef(false);
   const endingRef = useRef(false);
   const enterFullscreen = useCallback(async () => {
     try {
@@ -178,7 +193,6 @@ export default function InterviewRoomPage({
         setFsExitNotice(false);
         setFsBlocked(false);
       } else if (
-        !fsOptionalRef.current &&
         !endingRef.current &&
         hasEnteredFs.current &&
         phaseRef.current !== "completed"
@@ -189,7 +203,7 @@ export default function InterviewRoomPage({
     }
     // First click anywhere counts as the gesture if the API allows it.
     function onFirstGesture() {
-      if (!document.fullscreenElement && !fsOptionalRef.current) {
+      if (!document.fullscreenElement) {
         void enterFullscreen();
       }
     }
@@ -221,6 +235,9 @@ export default function InterviewRoomPage({
   } | null>(null);
   const [nativeFaceCheck, setNativeFaceCheck] = useState(false);
   const [visionFailed, setVisionFailed] = useState(false);
+  // Short failure reason, shown as a tooltip on the tile — turns the next
+  // test run into a diagnosis when the face check stays off.
+  const [visionError, setVisionError] = useState("");
   // StrictMode double-invokes effects in dev — without this guard the first
   // question is spoken AND transcribed twice (the duplicate AI lines).
   const bootedRef = useRef(false);
@@ -237,11 +254,13 @@ export default function InterviewRoomPage({
       faceApiRef.current = api;
       setVisionReady(true);
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
       console.warn("[PrepMate AI] Vision models unavailable:", err);
       if (retry) {
         setTimeout(() => void loadVision(false), 8000);
       } else {
         setVisionFailed(true);
+        setVisionError(msg.slice(0, 120));
       }
     }
   }, []);
@@ -302,15 +321,20 @@ export default function InterviewRoomPage({
 
       // First question + session meta (passed via session start response)
       const firstQ = sessionStorage.getItem(`prepmate_question_${sessionId}`);
+      const firstKind =
+        sessionStorage.getItem(`prepmate_kind_${sessionId}`) === "technical"
+          ? ("technical" as const)
+          : ("hr" as const);
       if (firstQ) {
         setState((s) => ({ ...s, currentQuestion: firstQ }));
-        speakQuestion(firstQ);
+        speakQuestion(firstQ, firstKind);
       } else {
         // Refresh or direct link: recover the ask-state from the server so
         // the student is never stranded on "Loading...".
         try {
           const recovered = await apiFetch<{
             current_question: string | null;
+            current_question_kind?: string | null;
             questions_answered: number;
             total_questions: number;
             session: {
@@ -324,7 +348,10 @@ export default function InterviewRoomPage({
               ...s,
               currentQuestion: recovered.current_question!,
             }));
-            speakQuestion(recovered.current_question);
+            speakQuestion(
+              recovered.current_question,
+              recovered.current_question_kind === "technical" ? "technical" : "hr"
+            );
           } else {
             setState((s) => ({
               ...s,
@@ -341,7 +368,13 @@ export default function InterviewRoomPage({
             total_questions: recovered.total_questions,
             time_per_question: recovered.session.time_per_question ?? 60,
           });
-          setTimeLeft(recovered.session.time_per_question ?? 60);
+          if (recovered.session.interview_type !== "full") {
+            setTimeLeft(recovered.session.time_per_question ?? 60);
+          } else {
+            const rk =
+              recovered.current_question_kind === "technical" ? 60 : 40;
+            setTimeLeft(rk);
+          }
         } catch {
           setError("Could not load this session. It may not exist.");
           setState((s) => ({ ...s, currentQuestion: "Session not found." }));
@@ -352,7 +385,14 @@ export default function InterviewRoomPage({
         if (raw) {
           const parsed = JSON.parse(raw) as SessionMeta;
           setMeta(parsed);
-          if (parsed.time_per_question) setTimeLeft(parsed.time_per_question);
+          if (parsed.interview_type === "full") {
+            // Kind clock (meta arrives after the first speak: correct it).
+            setQKind(firstKind);
+            qKindRef.current = firstKind;
+            setTimeLeft(firstKind === "technical" ? 60 : 40);
+          } else if (parsed.time_per_question) {
+            setTimeLeft(parsed.time_per_question);
+          }
         }
       } catch {
         // Meta is cosmetic only — the interview works without it.
@@ -477,6 +517,24 @@ export default function InterviewRoomPage({
     return () => document.removeEventListener("visibilitychange", onVisibility);
   }, [pushAlert]);
 
+  // ── Full-mode session clock: 30:00 from room entry, then auto-end ─────────
+  // (time-boxed, not count-boxed). The per-question clock above is untouched.
+  const endSessionRef = useRef(() => {});
+  useEffect(() => {
+    if (meta?.interview_type !== "full" || state.phase === "completed") return;
+    const id = setInterval(() => {
+      const left =
+        FULL_SESSION_SECONDS -
+        Math.floor((Date.now() - sessionStartRef.current) / 1000);
+      setSessionLeft(Math.max(0, left));
+      if (left <= 0 && !timeUpRef.current) {
+        timeUpRef.current = true;
+        endSessionRef.current();
+      }
+    }, 1000);
+    return () => clearInterval(id);
+  }, [meta?.interview_type, state.phase]);
+
   // ── Answer countdown: ticks while the question is answerable (idle or
   // recording). TTS time doesn't count — the clock starts when you can act.
   // Paused behind the fullscreen entry overlay so nobody loses seconds to it.
@@ -528,11 +586,13 @@ export default function InterviewRoomPage({
   }, []);
 
   // ── TTS: speak AI question ─────────────────────────────────────────────────
-  function speakQuestion(text: string) {
+  function speakQuestion(text: string, kind: "hr" | "technical" = qKindRef.current) {
     if (typeof window === "undefined" || !window.speechSynthesis) return;
     setState((s) => ({ ...s, phase: "ai_speaking" }));
-    // Fresh question, fresh clock.
-    setTimeLeft(timeLimit);
+    // Fresh question, fresh clock (kind-labelled in full mode).
+    setQKind(kind);
+    qKindRef.current = kind;
+    setTimeLeft(limitFor(kind));
     addToTranscript("AI", text);
     const utt = new SpeechSynthesisUtterance(text);
     utt.rate = 1;
@@ -683,7 +743,10 @@ export default function InterviewRoomPage({
 
       if (eval_.next_question) {
         setState((s) => ({ ...s, currentQuestion: eval_.next_question! }));
-        speakQuestion(eval_.next_question);
+        speakQuestion(
+          eval_.next_question,
+          eval_.next_question_kind === "technical" ? "technical" : "hr"
+        );
       } else {
         // No more questions — end session
         await endSession();
@@ -696,7 +759,7 @@ export default function InterviewRoomPage({
           : "Something went wrong while scoring your answer. Please try again."
       );
       setState((s) => ({ ...s, phase: "idle" }));
-      setTimeLeft(timeLimit);
+      setTimeLeft(limitFor(qKindRef.current));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
@@ -757,6 +820,7 @@ export default function InterviewRoomPage({
       console.error("[PrepMate AI] End session error:", err);
     }
   }
+  endSessionRef.current = endSession;
 
   const formatTime = (s: number) =>
     `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
@@ -800,21 +864,14 @@ export default function InterviewRoomPage({
             >
               {fsExitNotice ? "Re-enter fullscreen" : "Enter fullscreen and begin"}
             </button>
-            <div className="flex items-center justify-between">
-              <button
-                onClick={() => {
-                  fsOptionalRef.current = true;
-                  setFsBlocked(false);
-                }}
-                className="text-white/40 hover:text-white/70 text-xs underline"
-              >
-                Fullscreen unavailable? Continue anyway
-              </button>
+            {/* No way back to a normal screen except ending: Esc only brings
+                this gate back. Browsers without fullscreen skip the lock. */}
+            <div className="flex items-center justify-center">
               <button
                 onClick={endSession}
                 className="text-[#FCA5A5] hover:text-white text-xs underline"
               >
-                End session
+                End session to leave
               </button>
             </div>
           </div>
@@ -889,7 +946,10 @@ export default function InterviewRoomPage({
                 ))}
               </div>
             ) : (
-              <p className="text-[11px] text-white/35 mt-1">
+              <p
+                className="text-[11px] text-white/35 mt-1"
+                title={visionFailed && visionError ? `Face check: ${visionError}` : undefined}
+              >
                 {state.phase === "recording"
                   ? `Listening ${formatTime(state.timerSeconds)}`
                   : state.phase === "transcribing"
@@ -1039,6 +1099,17 @@ export default function InterviewRoomPage({
             >
               <ClockIcon size={14} />
               {formatTime(timeLeft)} left
+              {meta?.interview_type === "full" && (
+                <span className="text-white/40 font-normal">
+                  · {qKind === "technical" ? "technical 60s" : "HR 40s"}
+                </span>
+              )}
+            </span>
+          )}
+          {meta?.interview_type === "full" && state.phase !== "completed" && (
+            <span className="inline-flex items-center gap-1.5 text-white/60 font-semibold">
+              <ClockIcon size={14} />
+              {formatTime(sessionLeft)} session left
             </span>
           )}
         </span>
