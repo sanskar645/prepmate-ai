@@ -104,6 +104,7 @@ export default function InterviewRoomPage({
   const [timeLeft, setTimeLeft] = useState(timeLimit);
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -140,27 +141,36 @@ export default function InterviewRoomPage({
     }
   }, []);
 
+  // Central camera/mic release: callable from unmount AND End Session.
+  // Without this the camera light stays on during the report redirect.
+  const stopCamera = useCallback(() => {
+    try {
+      mediaRecorderRef.current?.stream?.getTracks().forEach((t) => t.stop());
+    } catch {
+      // Recorder stream release is best-effort.
+    }
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+    const legacy = videoRef.current?.srcObject as MediaStream | undefined;
+    legacy?.getTracks().forEach((t) => t.stop());
+    if (videoRef.current) videoRef.current.srcObject = null;
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+  }, []);
+
   // ── Boot: get media + first question ───────────────────────────────────────
   useEffect(() => {
     if (bootedRef.current) return;
     bootedRef.current = true;
-    // Releasing camera/mic/speech on unmount: without this the camera light
-    // stays on and the mic stays hot across the whole site after leaving.
-    const stopMedia = () => {
-      const stream = videoRef.current?.srcObject as MediaStream | undefined;
-      stream?.getTracks().forEach((t) => t.stop());
-      if (videoRef.current) videoRef.current.srcObject = null;
-      if (typeof window !== "undefined" && window.speechSynthesis) {
-        window.speechSynthesis.cancel();
-      }
-    };
     async function boot() {
-      // Start camera/mic
+      // Start camera/mic — room scope only, released on End Session/unmount.
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
           video: true,
           audio: true,
         });
+        streamRef.current = stream;
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
         }
@@ -230,9 +240,9 @@ export default function InterviewRoomPage({
       void loadVision();
     }
     boot();
-    return () => stopMedia();
+    return () => stopCamera();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId]);
+  }, [sessionId, stopCamera]);
 
   // ── Clock (bottom bar) ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -404,7 +414,9 @@ export default function InterviewRoomPage({
     maxFacesRef.current = 0;
     tabSwitchesRef.current = 0;
     timerSecondsRef.current = 0;
-    const stream = videoRef.current?.srcObject as MediaStream;
+    const stream =
+      streamRef.current ??
+      (videoRef.current?.srcObject as MediaStream | null);
     if (!stream) {
       setError("Camera/mic stream not ready. Please allow access and retry.");
       return;
@@ -570,11 +582,10 @@ export default function InterviewRoomPage({
 
   // ── End Session ───────────────────────────────────────────────────────────
   async function endSession() {
-    // Stop any in-flight voiceover first — otherwise it talks over the report.
-    if (typeof window !== "undefined" && window.speechSynthesis) {
-      window.speechSynthesis.cancel();
-    }
-    setState((s) => ({ ...s, phase: "completed" }));
+    // Release camera/mic immediately — before the API call + redirect — so
+    // the camera light goes off the moment the interview ends.
+    stopCamera();
+    setState((s) => ({ ...s, isRecording: false, phase: "completed" }));
     try {
       await apiFetch("/interview/end", {
         method: "POST",
