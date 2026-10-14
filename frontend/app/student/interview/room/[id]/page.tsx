@@ -136,13 +136,99 @@ export default function InterviewRoomPage({
       setProctorAlerts((prev) => prev.filter((a) => a.id !== id));
     }, 6000);
   }, []);
+  const warnFaces = useCallback(() => {
+    const nowMs = Date.now();
+    if (nowMs - lastFaceWarnRef.current < 10000) return;
+    lastFaceWarnRef.current = nowMs;
+    pushAlert("faces", "More than one face visible. Only you should be in frame.");
+  }, [pushAlert]);
+
+  // ── Fullscreen proctored lock ──────────────────────────────────────────────
+  // The interview runs fullscreen (browser + taskbar chrome hidden) and the
+  // student must end the session before doing anything else. Fullscreen needs
+  // a user gesture, so entry is a blocking overlay, not an auto-request.
+  const phaseRef = useRef(state.phase);
+  phaseRef.current = state.phase;
+  const fsAvailable =
+    typeof document !== "undefined" &&
+    !!document.documentElement.requestFullscreen;
+  const [fsBlocked, setFsBlocked] = useState(fsAvailable);
+  const [fsExitNotice, setFsExitNotice] = useState(false);
+  const hasEnteredFs = useRef(false);
+  const fsOptionalRef = useRef(false);
+  const endingRef = useRef(false);
+  const enterFullscreen = useCallback(async () => {
+    try {
+      if (!document.fullscreenElement && document.documentElement.requestFullscreen) {
+        await document.documentElement.requestFullscreen();
+      }
+      hasEnteredFs.current = true;
+      setFsExitNotice(false);
+      setFsBlocked(false);
+    } catch {
+      // Denied without a gesture — the overlay stays until it succeeds.
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!fsAvailable) return;
+    function onFsChange() {
+      if (document.fullscreenElement) {
+        hasEnteredFs.current = true;
+        setFsExitNotice(false);
+        setFsBlocked(false);
+      } else if (
+        !fsOptionalRef.current &&
+        !endingRef.current &&
+        hasEnteredFs.current &&
+        phaseRef.current !== "completed"
+      ) {
+        setFsExitNotice(true);
+        setFsBlocked(true);
+      }
+    }
+    // First click anywhere counts as the gesture if the API allows it.
+    function onFirstGesture() {
+      if (!document.fullscreenElement && !fsOptionalRef.current) {
+        void enterFullscreen();
+      }
+    }
+    document.addEventListener("fullscreenchange", onFsChange);
+    window.addEventListener("pointerdown", onFirstGesture, { once: true });
+    return () => {
+      document.removeEventListener("fullscreenchange", onFsChange);
+      window.removeEventListener("pointerdown", onFirstGesture);
+    };
+  }, [fsAvailable, enterFullscreen]);
+
+  // Closing or refreshing mid-interview warns first (standard exam behaviour).
+  useEffect(() => {
+    function onBeforeUnload(e: BeforeUnloadEvent) {
+      if (phaseRef.current !== "completed" && !endingRef.current) {
+        e.preventDefault();
+      }
+    }
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, []);
+
+  // ── Face-check backends ────────────────────────────────────────────────────
+  // Primary: TF.js expressions (presence scoring). Fast path: the browser's
+  // native FaceDetector (Chromium) counts faces with no model download, so
+  // multi-face warnings work even when the TF.js bundle is slow or blocked.
+  const nativeRef = useRef<{
+    detect(v: HTMLVideoElement): Promise<unknown[]>;
+  } | null>(null);
+  const [nativeFaceCheck, setNativeFaceCheck] = useState(false);
+  const [visionFailed, setVisionFailed] = useState(false);
   // StrictMode double-invokes effects in dev — without this guard the first
   // question is spoken AND transcribed twice (the duplicate AI lines).
   const bootedRef = useRef(false);
 
-  // Lazy-load the face model once. Failure is non-fatal: the interview works
-  // exactly as before, just without the presence signal.
-  const loadVision = useCallback(async () => {
+  // Lazy-load the face model once, with one retry. Failure is non-fatal:
+  // the interview works as before and the native Chromium face counter (see
+  // boot) still guards against multiple faces — just without expressions.
+  const loadVision = useCallback(async (retry = true) => {
     if (faceApiRef.current) return;
     try {
       const api = (await import("@vladmandic/face-api")) as unknown as FaceApi;
@@ -152,6 +238,11 @@ export default function InterviewRoomPage({
       setVisionReady(true);
     } catch (err) {
       console.warn("[PrepMate AI] Vision models unavailable:", err);
+      if (retry) {
+        setTimeout(() => void loadVision(false), 8000);
+      } else {
+        setVisionFailed(true);
+      }
     }
   }, []);
 
@@ -190,6 +281,23 @@ export default function InterviewRoomPage({
         }
       } catch {
         console.warn("[PrepMate AI] Camera/mic access denied");
+      }
+
+      // Native face counter (Chromium FaceDetector): instant, no download.
+      try {
+        const FD = (
+          window as unknown as {
+            FaceDetector?: new (opts?: object) => {
+              detect(v: HTMLVideoElement): Promise<unknown[]>;
+            };
+          }
+        ).FaceDetector;
+        if (FD) {
+          nativeRef.current = new FD({ fastMode: true, maxDetectedFaces: 5 });
+          setNativeFaceCheck(true);
+        }
+      } catch {
+        // Unsupported browser — TF.js path still tries below.
       }
 
       // First question + session meta (passed via session start response)
@@ -285,20 +393,38 @@ export default function InterviewRoomPage({
     if (el) el.scrollTop = el.scrollHeight;
   }, [state.transcript, lastEval]);
 
-  // ── Presence + proctor monitoring: face watch runs for the whole
+  // ── Presence + proctor monitoring: the face watch runs for the whole
   // interview (not just while recording); presence samples are collected
   // only while recording for scoring. Frames never leave the browser.
+  // Counting source: native detector until TF.js is ready, then TF.js —
+  // never both, so one second in frame is one sample, not two.
   useEffect(() => {
     recordingRef.current = state.isRecording;
   }, [state.isRecording]);
 
   useEffect(() => {
-    if (!visionReady || state.phase === "completed") return;
+    if (state.phase === "completed") return;
     const id = setInterval(async () => {
-      if (samplingBusyRef.current) return;
       const video = videoRef.current;
+      if (!video || video.readyState < 2) return;
       const api = faceApiRef.current;
-      if (!video || !api || video.readyState < 2) return;
+      // Fast native path while TF.js is still loading or blocked.
+      if (!api && nativeRef.current) {
+        try {
+          const faces = await nativeRef.current.detect(video);
+          if (faces.length > 1) {
+            multiFaceRef.current += 1;
+            warnFaces();
+          }
+          if (faces.length > maxFacesRef.current) {
+            maxFacesRef.current = faces.length;
+          }
+        } catch {
+          // One failed frame must never break the loop.
+        }
+        return;
+      }
+      if (!api || samplingBusyRef.current) return;
       samplingBusyRef.current = true;
       try {
         const dets = await api
@@ -307,14 +433,7 @@ export default function InterviewRoomPage({
         const faces = dets.length;
         if (faces > 1) {
           multiFaceRef.current += 1;
-          const nowMs = Date.now();
-          if (nowMs - lastFaceWarnRef.current > 10000) {
-            lastFaceWarnRef.current = nowMs;
-            pushAlert(
-              "faces",
-              "More than one face visible. Only you should be in frame."
-            );
-          }
+          warnFaces();
         }
         if (faces > maxFacesRef.current) maxFacesRef.current = faces;
         if (!recordingRef.current) return;
@@ -340,7 +459,7 @@ export default function InterviewRoomPage({
     return () => {
       clearInterval(id);
     };
-  }, [visionReady, state.phase, pushAlert]);
+  }, [state.phase, warnFaces]);
 
   // ── Tab-switch tracking: leaving the tab mid-interview warns live and
   // uploads as telemetry (possible lookup on another tab or device).
@@ -360,12 +479,14 @@ export default function InterviewRoomPage({
 
   // ── Answer countdown: ticks while the question is answerable (idle or
   // recording). TTS time doesn't count — the clock starts when you can act.
+  // Paused behind the fullscreen entry overlay so nobody loses seconds to it.
   useEffect(() => {
+    if (fsBlocked) return;
     if (state.phase !== "idle" && state.phase !== "recording") return;
     if (timeLeft <= 0) return;
     const id = setTimeout(() => setTimeLeft((t) => t - 1), 1000);
     return () => clearTimeout(id);
-  }, [state.phase, timeLeft]);
+  }, [state.phase, timeLeft, fsBlocked]);
 
   // At zero: a live take auto-submits; an unstarted question auto-skips as a
   // zero (no time left to look the answer up).
@@ -613,8 +734,17 @@ export default function InterviewRoomPage({
 
   // ── End Session ───────────────────────────────────────────────────────────
   async function endSession() {
-    // Release camera/mic immediately — before the API call + redirect — so
-    // the camera light goes off the moment the interview ends.
+    // Release camera/mic + fullscreen immediately — before the API call and
+    // redirect — so the camera light and the lock go off the moment it ends.
+    endingRef.current = true;
+    phaseRef.current = "completed";
+    try {
+      if (typeof document !== "undefined" && document.fullscreenElement) {
+        await document.exitFullscreen();
+      }
+    } catch {
+      // Exiting fullscreen is best-effort; the session still ends.
+    }
     stopCamera();
     setState((s) => ({ ...s, isRecording: false, phase: "completed" }));
     try {
@@ -648,7 +778,48 @@ export default function InterviewRoomPage({
     : "";
 
   return (
-    <div className="h-[calc(100vh-64px)] flex flex-col bg-[#0A0A18]">
+    <div className="h-[100dvh] flex flex-col bg-[#0A0A18]">
+      {/* Fullscreen proctored lock: entry gate + re-entry gate on exit */}
+      {fsBlocked && (
+        <div className="fixed inset-0 z-[60] bg-[#0A0A18]/95 flex items-center justify-center px-4">
+          <div className="max-w-md w-full bg-[#141428] border border-white/10 rounded-2xl p-8 text-center">
+            <div className="w-12 h-12 mx-auto bg-[#EF4444]/15 border border-[#EF4444]/30 rounded-full flex items-center justify-center mb-4 text-[#FCA5A5]">
+              <AlertIcon size={22} />
+            </div>
+            <h2 className="text-white text-xl font-bold mb-2">
+              {fsExitNotice ? "You left fullscreen" : "Proctored interview"}
+            </h2>
+            <p className="text-white/55 text-sm leading-relaxed mb-6">
+              {fsExitNotice
+                ? "Re-enter fullscreen to continue. The answer timer keeps running while you are out."
+                : "This interview runs fullscreen with camera monitoring. Stay visible, keep one face in frame, and stay on this tab until you end the session."}
+            </p>
+            <button
+              onClick={enterFullscreen}
+              className="w-full bg-[#2563EB] hover:bg-blue-600 text-white font-semibold px-6 py-3 rounded-xl transition-colors mb-3"
+            >
+              {fsExitNotice ? "Re-enter fullscreen" : "Enter fullscreen and begin"}
+            </button>
+            <div className="flex items-center justify-between">
+              <button
+                onClick={() => {
+                  fsOptionalRef.current = true;
+                  setFsBlocked(false);
+                }}
+                className="text-white/40 hover:text-white/70 text-xs underline"
+              >
+                Fullscreen unavailable? Continue anyway
+              </button>
+              <button
+                onClick={endSession}
+                className="text-[#FCA5A5] hover:text-white text-xs underline"
+              >
+                End session
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {/* Proctored session banner */}
       <div className="px-4 pt-3 flex items-center gap-2">
         <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-[#FCA5A5] bg-[#EF4444]/10 border border-[#EF4444]/30 px-2.5 py-1 rounded-lg">
@@ -725,9 +896,11 @@ export default function InterviewRoomPage({
                     ? "Transcribing..."
                     : state.phase === "grading"
                       ? "Grading..."
-                      : visionReady
-                        ? "Ready"
-                        : "Loading vision..."}
+                      : visionReady || nativeFaceCheck
+                        ? "Face check on"
+                        : visionFailed
+                          ? "Face check off"
+                          : "Starting face check..."}
               </p>
             )}
             {state.isRecording && (

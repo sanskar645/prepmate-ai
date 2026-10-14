@@ -62,6 +62,23 @@ function parsePresenceMetrics(
   }
 }
 
+// Defensive: older model answers may arrive JSON-shaped
+// ({"response": "..."}). Always render the plain answer text.
+function cleanModelAnswer(text: string): string {
+  const t = text.trim();
+  if (!t.startsWith("{")) return t;
+  try {
+    const data = JSON.parse(t) as Record<string, unknown>;
+    for (const key of ["response", "answer", "model_answer", "example"]) {
+      const v = data[key];
+      if (typeof v === "string" && v.trim()) return v.trim();
+    }
+  } catch {
+    // Not parseable JSON — fall through to raw text.
+  }
+  return t;
+}
+
 export default function InterviewReportPage({
   params,
 }: {
@@ -467,7 +484,7 @@ export default function InterviewReportPage({
                       Model answer
                     </p>
                     <p className="text-[var(--muted)] text-sm leading-relaxed">
-                      {modelAnswers[ans.answer_id].text}
+                      {cleanModelAnswer(modelAnswers[ans.answer_id].text ?? "")}
                     </p>
                   </div>
                 ) : (

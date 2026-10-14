@@ -225,20 +225,26 @@ async def evaluate_answer(
     return _fallback_rubric_scorer(transcript_text, question_text)
 
 
-async def _gemini_text(prompt: str, temperature: float) -> tuple[str | None, float]:
-    """Raw text completion. Returns (text, retry_delay_seconds)."""
+async def _gemini_text(
+    prompt: str, temperature: float, json_mode: bool = True
+) -> tuple[str | None, float]:
+    """Raw text completion. Returns (text, retry_delay_seconds).
+
+    json_mode forces a JSON response (evaluation, flashcards, resume
+    questions). Plain-text callers (model answers) pass json_mode=False.
+    """
     _resolve_clients()
     if genai_client is None:
         logger.warning("Gemini call skipped: GOOGLE_API_KEY is not configured.")
         return None, 0.0
     try:
+        config = types.GenerateContentConfig(temperature=temperature)
+        if json_mode:
+            config.response_mime_type = "application/json"
         response = await genai_client.aio.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=temperature,
-                response_mime_type="application/json",
-            ),
+            config=config,
         )
         return (response.text or "").strip(), 0.0
     except Exception as e:
@@ -489,7 +495,25 @@ not a lecture and not bullet points.
 Interview type: {interview_type}
 Difficulty: {difficulty}
 Question: {question}
-Return ONLY the example answer as plain text, no quotes, no intro line."""
+Return ONLY the example answer as plain text, no quotes, no intro line.
+Do not use JSON, do not add any field names or braces."""
+
+
+def _strip_model_answer(text: str) -> str:
+    """Defensive plain-text extraction (a JSON-shaped reply still shows clean)."""
+    cleaned = re.sub(r"^```json\s*|\s*```$", "", text.strip(), flags=re.MULTILINE).strip()
+    if not cleaned.startswith("{"):
+        return cleaned
+    try:
+        data = json.loads(cleaned)
+    except (TypeError, ValueError):
+        return cleaned
+    if isinstance(data, dict):
+        for key in ("response", "answer", "model_answer", "example"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return cleaned
 
 
 async def generate_model_answer(
@@ -508,5 +532,5 @@ async def generate_model_answer(
         difficulty=difficulty or "medium",
         question=question,
     )
-    text, _ = await _gemini_text(prompt, temperature=0.5)
-    return (text or "").strip()[:1500]
+    text, _ = await _gemini_text(prompt, temperature=0.5, json_mode=False)
+    return _strip_model_answer(text or "")[:1500]

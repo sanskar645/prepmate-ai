@@ -39,7 +39,10 @@ export default function Navbar() {
   return (
     // The TPO portal has its own sidebar shell — the student navbar must
     // never render inside /admin (that overlap was the visible loophole).
-    pathname?.startsWith("/admin") ? null : (
+    // The interview room is a fullscreen proctored exam surface: no navbar,
+    // just the interview (it owns the full viewport height instead).
+    pathname?.startsWith("/admin") ||
+    pathname?.startsWith("/student/interview/room") ? null : (
     <header className="border-b border-[var(--border)] backdrop-blur-sm sticky top-0 z-50 bg-[var(--nav-bg)]">
       <nav className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
         {/* Logo routes smart: home for guests, your dashboard when signed in
